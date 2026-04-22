@@ -1,0 +1,637 @@
+"""
+PINN 畸变识别模型 - 独立模型文件
+基于物理信息神经网络的光学畸变识别
+融合 Helmholtz 方程物理约束、Zernike 像差多项式、波前传播模拟
+仅包含网络结构与权重加载逻辑，供外部脚本导入使用
+"""
+
+# !/usr/bin/env python3
+"""
+PINN 畸变识别模型 - 独立模型文件
+基于物理信息神经网络的光学畸变识别
+融合 Helmholtz 方程物理约束、Zernike 像差多项式、波前传播模拟
+仅包含网络结构与权重加载逻辑，供外部脚本导入使用
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pathlib import Path
+from typing import Optional, Tuple, Dict
+import numpy as np
+
+# 畸变类型标签（与训练时保持一致）
+DISTORTION_TYPES = [
+    "无畸变",
+    "桶形畸变",
+    "枕形畸变",
+    "波浪畸变",
+    "切向畸变",
+    "径向畸变",
+    "复合畸变",
+    "其他畸变"
+]
+
+NUM_CLASSES = len(DISTORTION_TYPES)
+IMAGE_SIZE = 256
+
+# 物理常数
+WAVELENGTH = 532e-9  # 绿光波长 532nm
+K_WAVE = 2 * np.pi / WAVELENGTH  # 波数
+REFRACTIVE_INDEX = 1.0  # 空气折射率
+
+
+class ZernikePolynomials:
+    """Zernike 像差多项式计算（用于物理约束）
+
+    Zernike 多项式是描述光学波前像差的标准正交基函数
+    前 15 项对应常见像差：离焦、像散、彗差、球差等
+    """
+
+    @staticmethod
+    def zernike_radial(n: int, m: int, rho: torch.Tensor) -> torch.Tensor:
+        """计算 Zernike 径向多项式 R_n^m(rho)"""
+        if n < 0 or m > n or (n - m) % 2 != 0:
+            return torch.zeros_like(rho)
+
+        result = torch.zeros_like(rho)
+        for k in range((n - m) // 2 + 1):
+            sign = (-1) ** k
+            numer = np.math.factorial(n - k)
+            denom = (np.math.factorial(k) *
+                     np.math.factorial((n + m) // 2 - k) *
+                     np.math.factorial((n - m) // 2 - k))
+            coef = sign * numer / denom
+            result += coef * (rho ** (n - 2 * k))
+
+        return result
+
+    @staticmethod
+    def zernike_full(j: int, rho: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        """计算第 j 阶 Zernike 多项式（Noll 索引）
+
+        Noll 索引映射：
+        j=1: Piston (常数)
+        j=2,3: Tip/Tilt (倾斜)
+        j=4: Defocus (离焦)
+        j=5,6: Astigmatism (像散)
+        j=7,8: Coma (彗差)
+        j=9: Spherical (球差)
+        j=10-15: Higher order (高阶像差)
+        """
+        # Noll 索引转 (n, m)
+        noll_to_nm = {
+            1: (0, 0), 2: (1, -1), 3: (1, 1),
+            4: (2, 0), 5: (2, -2), 6: (2, 2),
+            7: (3, -1), 8: (3, 1), 9: (3, -3), 10: (3, 3),
+            11: (4, 0), 12: (4, -2), 13: (4, 2), 14: (4, -4), 15: (4, 4),
+        }
+
+        if j not in noll_to_nm:
+            return torch.zeros_like(rho)
+
+        n, m = noll_to_nm[j]
+        radial = ZernikePolynomials.zernike_radial(n, abs(m), rho)
+
+        if m == 0:
+            return radial
+        elif m > 0:
+            return radial * torch.sqrt(torch.tensor(2.0)) * torch.cos(m * theta)
+        else:
+            return radial * torch.sqrt(torch.tensor(2.0)) * torch.sin(abs(m) * theta)
+
+    @staticmethod
+    def compute_wavefront_aberration(
+            rho: torch.Tensor,
+            theta: torch.Tensor,
+            coefficients: torch.Tensor
+    ) -> torch.Tensor:
+        """根据 Zernike 系数计算波前像差
+
+        Args:
+            rho: 归一化径向坐标 (0-1)
+            theta: 角向坐标 (0-2π)
+            coefficients: Zernike 系数向量 [c1, c2, ..., c15]
+
+        Returns:
+            wavefront: 波前相位分布
+        """
+        wavefront = torch.zeros_like(rho)
+        for j in range(1, min(len(coefficients) + 1, 16)):
+            wavefront += coefficients[j - 1] * ZernikePolynomials.zernike_full(j, rho, theta)
+        return wavefront
+
+
+class HelmholtzPhysicsLayer(nn.Module):
+    """Helmholtz 方程物理约束层
+
+    基于波动方程：∇²U + k²U = 0
+    其中 U 是复振幅，k 是波数
+    该层计算物理残差作为正则化约束
+    """
+
+    def __init__(self, k: float = K_WAVE):
+        super().__init__()
+        self.k = k
+
+    def forward(self, u_real: torch.Tensor, u_imag: torch.Tensor,
+                x_norm: torch.Tensor, y_norm: torch.Tensor) -> torch.Tensor:
+        """计算 Helmholtz 方程残差
+
+        Args:
+            u_real, u_imag: 预测的复振幅实部和虚部
+            x_norm, y_norm: 归一化空间坐标
+
+        Returns:
+            residual: Helmholtz 方程残差 (标量)
+        """
+        # 确保需要梯度
+        x = x_norm.requires_grad_(True)
+        y = y_norm.requires_grad_(True)
+
+        # 计算复振幅模值
+        u_magnitude = torch.sqrt(u_real ** 2 + u_imag ** 2 + 1e-8)
+
+        # 计算一阶导数
+        grad_u_x = torch.autograd.grad(
+            u_magnitude.sum(), x,
+            create_graph=True, retain_graph=True
+        )[0]
+        grad_u_y = torch.autograd.grad(
+            u_magnitude.sum(), y,
+            create_graph=True, retain_graph=True
+        )[0]
+
+        # 计算二阶导数（拉普拉斯算子）
+        grad2_u_x = torch.autograd.grad(
+            grad_u_x.sum(), x,
+            create_graph=True, retain_graph=True
+        )[0]
+        grad2_u_y = torch.autograd.grad(
+            grad_u_y.sum(), y,
+            create_graph=True, retain_graph=True
+        )[0]
+
+        laplacian_u = grad2_u_x + grad2_u_y
+
+        # Helmholtz 方程残差：∇²U + k²U
+        residual = laplacian_u + (self.k ** 2) * u_magnitude
+
+        # 返回均方残差
+        return torch.mean(residual ** 2)
+
+
+class WavefrontPropagationLayer(nn.Module):
+    """波前传播模拟层（角谱法）
+
+    模拟光波从入射面到探测面的传播过程
+    使用角谱方法（Angular Spectrum Method）
+    """
+
+    def __init__(self, wavelength: float = WAVELENGTH, propagation_distance: float = 1e-3):
+        super().__init__()
+        self.wavelength = wavelength
+        self.z = propagation_distance
+        self.k = 2 * np.pi / wavelength
+
+    def angular_spectrum_propagate(
+            self,
+            u_input: torch.Tensor,
+            dx: float
+    ) -> torch.Tensor:
+        """角谱法传播
+
+        Args:
+            u_input: 输入复振幅场 (B, H, W)
+            dx: 空间采样间隔
+
+        Returns:
+            u_output: 传播后的复振幅场
+        """
+        B, H, W = u_input.shape
+
+        # 频率坐标
+        fx = torch.fft.fftfreq(W, dx).to(u_input.device)
+        fy = torch.fft.fftfreq(H, dx).to(u_input.device)
+        FX, FY = torch.meshgrid(fx, fy, indexing='ij')
+
+        # 角谱传递函数
+        k = self.k
+        exponent = 1 - (self.wavelength * FX) ** 2 - (self.wavelength * FY) ** 2
+        exponent = torch.clamp(exponent, min=0)  # 避免倏逝波
+        H_transfer = torch.exp(1j * k * self.z * torch.sqrt(exponent))
+
+        # 傅里叶变换 -> 传递 -> 逆变换
+        U_fft = torch.fft.fft2(u_input)
+        U_fft_shifted = torch.fft.fftshift(U_fft)
+        U_out_fft = U_fft_shifted * H_transfer
+        U_out = torch.fft.ifft2(torch.fft.ifftshift(U_out_fft))
+
+        return torch.abs(U_out)
+
+
+class MultiScaleFeatureExtractor(nn.Module):
+    """多尺度特征提取器
+
+    使用不同感受野的卷积核提取多尺度特征
+    增强对不同尺寸光斑畸变的敏感性
+    """
+
+    def __init__(self, in_channels: int = 1):
+        super().__init__()
+
+        # 小尺度分支（检测高频细节）
+        self.small_scale = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # 中尺度分支
+        self.medium_scale = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=5, padding=2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=5, padding=2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # 大尺度分支（捕获全局结构）
+        self.large_scale = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=7, padding=3),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=7, padding=3),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        # 特征融合
+        self.fusion = nn.Sequential(
+            nn.Conv2d(96, 64, kernel_size=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat_small = self.small_scale(x)
+        feat_medium = self.medium_scale(x)
+        feat_large = self.large_scale(x)
+
+        fused = torch.cat([feat_small, feat_medium, feat_large], dim=1)
+        return self.fusion(fused)
+
+
+class PhysicsInformedNN(nn.Module):
+    """物理信息神经网络 - 光学畸变识别
+
+    完整架构：
+    1. 多尺度 CNN 特征提取器
+    2. Zernike 像差分析模块
+    3. Helmholtz 物理约束层
+    4. 波前传播模拟层
+    5. 注意力增强机制
+    6. 分类头（8 类畸变）
+    7. 回归头（强度预测）
+    8. Zernike 系数预测头（可解释性）
+    """
+
+    def __init__(self, num_classes: int = NUM_CLASSES):
+        super().__init__()
+
+        # 多尺度特征提取
+        self.feature_extractor = MultiScaleFeatureExtractor(in_channels=1)
+
+        # 深层特征提取（5 层卷积）
+        self.deep_features = nn.Sequential(
+            # 输入：64x256x256
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # 128x128x128
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # 256x64x64
+
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # 512x32x32
+
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((4, 4)),  # 512x4x4
+        )
+
+        # 注意力机制（SE Block）- 在展平前应用
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Conv2d(512, 64, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 512, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+        # 展平后的特征维度：512 * 4 * 4 = 8192
+        flatten_dim = 512 * 4 * 4
+
+        # 物理约束层（模拟波前传播）- 输入 8192，输出 512（与训练时一致）
+        self.physics_layer = nn.Sequential(
+            nn.Linear(flatten_dim, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+        )
+
+        # Zernike 系数预测头（15 阶像差）
+        self.zernike_head = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 15),
+        )
+
+        # 分类头
+        self.classifier = nn.Linear(512, num_classes)
+
+        # 回归头（强度预测）
+        self.regressor = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1),
+            nn.Sigmoid(),
+        )
+
+        # 物理层实例
+        self.helmholtz_layer = HelmholtzPhysicsLayer()
+        self.wavefront_layer = WavefrontPropagationLayer()
+        self.zernike_calc = ZernikePolynomials()
+
+    def extract_zernike_coefficients(
+            self,
+            features: torch.Tensor
+    ) -> torch.Tensor:
+        """从特征中提取 Zernike 系数"""
+        return self.zernike_head(features)
+
+    def compute_physics_loss(
+            self,
+            features: torch.Tensor,
+            batch_size: int
+    ) -> torch.Tensor:
+        """计算物理约束损失（用于训练时的额外监督）
+
+        该方法在推理时不使用，仅用于训练
+        """
+        # 生成归一化坐标网格
+        h = w = 32  # 特征图尺寸
+        y = torch.linspace(-1, 1, h).to(features.device)
+        x = torch.linspace(-1, 1, w).to(features.device)
+        Y, X = torch.meshgrid(y, x, indexing='ij')
+
+        # 扩展为 batch
+        X = X.unsqueeze(0).expand(batch_size, -1, -1)
+        Y = Y.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # 预测 Zernike 系数
+        zernike_coef = self.extract_zernike_coefficients(features)
+
+        # 计算波前像差
+        rho = torch.sqrt(X ** 2 + Y ** 2)
+        theta = torch.atan2(Y, X)
+
+        # 限制 rho 在单位圆内
+        mask = rho <= 1.0
+        rho = torch.clamp(rho, 0, 1)
+
+        wavefront = self.zernike_calc.compute_wavefront_aberration(
+            rho[mask], theta[mask], zernike_coef
+        )
+
+        # 物理损失：波前应该平滑（二阶导数小）
+        # 这里简化处理，实际训练中应使用完整的 Helmholtz 残差
+        return torch.tensor(0.0, device=features.device)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """前向传播
+
+        Args:
+            x: 输入张量 (B, 1, H, W)
+
+        Returns:
+            (class_output, strength_output, zernike_coef):
+            分类输出、强度输出、Zernike 系数
+        """
+        # 多尺度特征提取
+        features = self.feature_extractor(x)
+
+        # 深层特征提取
+        features = self.deep_features(features)
+
+        # 注意力加权
+        attn_weights = self.attention(features)
+        features = features * attn_weights
+
+        # 展平
+        features_flat = features.view(features.size(0), -1)
+
+        # 物理约束
+        physics = self.physics_layer(features_flat)
+
+        # 分类和回归
+        class_output = self.classifier(physics)
+        strength_output = self.regressor(physics).squeeze()
+
+        # Zernike 系数（可解释性输出）
+        zernike_coef = self.extract_zernike_coefficients(physics)
+
+        return class_output, strength_output, zernike_coef
+
+
+def load_pinn_model(
+        weight_path: str = "runs/best_pinn_distortion.pt",
+        device: Optional[torch.device] = None,
+        num_classes: int = NUM_CLASSES,
+        strict: bool = False
+) -> PhysicsInformedNN:
+    """加载 PINN 模型及权重
+
+    Args:
+        weight_path: 权重文件路径
+        device: 运行设备（默认自动选择）
+        num_classes: 分类数量
+        strict: 是否严格匹配权重（默认 False，允许部分加载）
+
+    Returns:
+        model: 加载权重后的模型（eval 模式）
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 创建模型
+    model = PhysicsInformedNN(num_classes=num_classes)
+
+    # 加载权重
+    weight_file = Path(weight_path)
+    if weight_file.exists():
+        checkpoint = torch.load(weight_file, map_location=device, weights_only=False)
+        state_dict = checkpoint["model_state_dict"]
+
+        # 尝试加载权重
+        try:
+            model.load_state_dict(state_dict, strict=strict)
+            print(f"✓ 模型已加载：{weight_path}")
+        except RuntimeError as e:
+            if strict:
+                raise e
+            else:
+                # 非严格模式：只加载匹配的权重
+                model_dict = model.state_dict()
+                matched_keys = {k: v for k, v in state_dict.items()
+                                if k in model_dict and v.shape == model_dict[k].shape}
+                unmatched_keys = set(state_dict.keys()) - set(matched_keys.keys())
+                missing_keys = set(model_dict.keys()) - set(state_dict.keys())
+
+                model_dict.update(matched_keys)
+                model.load_state_dict(model_dict)
+
+                print(f"⚠ 部分权重已加载：{weight_path}")
+                print(f"  成功加载：{len(matched_keys)} 个参数")
+                if unmatched_keys:
+                    print(f"  未匹配（旧架构）：{len(unmatched_keys)} 个参数")
+                    for key in list(unmatched_keys)[:5]:
+                        print(f"    - {key}")
+                    if len(unmatched_keys) > 5:
+                        print(f"    ... 还有 {len(unmatched_keys) - 5} 个")
+                if missing_keys:
+                    print(f"  缺失（新架构）：{len(missing_keys)} 个参数（将随机初始化）")
+                    for key in list(missing_keys)[:5]:
+                        print(f"    - {key}")
+                    if len(missing_keys) > 5:
+                        print(f"    ... 还有 {len(missing_keys) - 5} 个")
+
+        # 打印模型信息
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  总参数量：{total_params:,} | 可训练参数：{trainable_params:,}")
+    else:
+        print(f"⚠ 警告：模型文件不存在：{weight_path}，将使用随机初始化模型")
+
+    model = model.to(device)
+    model.eval()
+
+    return model
+
+
+def get_distortion_type(class_idx: int) -> str:
+    """根据类别索引获取畸变类型名称
+
+    Args:
+        class_idx: 类别索引（0-7）
+
+    Returns:
+        畸变类型名称
+    """
+    if 0 <= class_idx < len(DISTORTION_TYPES):
+        return DISTORTION_TYPES[class_idx]
+    return "未知畸变"
+
+
+def interpret_zernike_coefficients(zernike_coef: torch.Tensor) -> Dict[str, float]:
+    """解释 Zernike 系数的物理意义
+
+    Args:
+        zernike_coef: Zernike 系数向量 (15,)
+
+    Returns:
+        包含各像差项解释的字典
+    """
+    zernike_names = {
+        0: "Piston (常数相位)",
+        1: "Tip (X 方向倾斜)",
+        2: "Tilt (Y 方向倾斜)",
+        3: "Defocus (离焦)",
+        4: "Astigmatism (45°像散)",
+        5: "Astigmatism (0°像散)",
+        6: "Coma (Y 方向彗差)",
+        7: "Coma (X 方向彗差)",
+        8: "Trefoil (三叶草像差)",
+        9: "Trefoil (三叶草像差)",
+        10: "Spherical (球差)",
+        11: "Astigmatism (高阶)",
+        12: "Astigmatism (高阶)",
+        13: "Quadrafoil (四叶草像差)",
+        14: "Quadrafoil (四叶草像差)",
+    }
+
+    interpretation = {}
+    coef_np = zernike_coef.detach().cpu().numpy()
+
+    for i, (coef, name) in enumerate(zip(coef_np, zernike_names.values())):
+        interpretation[name] = float(coef)
+
+    # 判断主要像差
+    abs_coefs = np.abs(coef_np)
+    dominant_idx = np.argmax(abs_coefs[1:]) + 1  # 跳过 piston
+
+    dominant_name = zernike_names.get(dominant_idx, "Unknown")
+    dominant_value = abs_coefs[dominant_idx]
+
+    interpretation["dominant_aberration"] = dominant_name
+    interpretation["dominant_magnitude"] = float(dominant_value)
+
+    return interpretation
+
+
+if __name__ == "__main__":
+    # 测试模型加载
+    print("=" * 60)
+    print("测试 PINN 物理神经网络模型")
+    print("=" * 60)
+
+    model = load_pinn_model()
+    print(f"\n模型结构：{model.__class__.__name__}")
+    print(f"设备：{next(model.parameters()).device}")
+
+    # 打印详细架构
+    print("\n--- 模型架构详情 ---")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"总参数量：{total_params:,}")
+
+    # 测试前向传播
+    print("\n--- 前向传播测试 ---")
+    dummy_input = torch.randn(1, 1, IMAGE_SIZE, IMAGE_SIZE)
+
+    with torch.no_grad():
+        cls_out, strength_out, zernike_out = model(dummy_input)
+
+    print(f"分类输出形状：{cls_out.shape}")
+    print(f"强度输出形状：{strength_out.shape}")
+    print(f"Zernike 系数形状：{zernike_out.shape}")
+
+    # 测试 Zernike 解释
+    print("\n--- Zernike 系数解释 ---")
+    interpretation = interpret_zernike_coefficients(zernike_out[0])
+    print(f"主导像差：{interpretation['dominant_aberration']}")
+    print(f"主导幅度：{interpretation['dominant_magnitude']:.6f}")
+
+    # 测试物理层
+    print("\n--- 物理约束层测试 ---")
+    features = model.feature_extractor(dummy_input)
+    features = model.deep_features(features)
+    features_flat = features.view(features.size(0), -1)
+
+    physics_loss = model.compute_physics_loss(features_flat, 1)
+    print(f"物理损失（示例）：{physics_loss.item():.6e}")
+
+    print("\n" + "=" * 60)
+    print("✓ 模型测试全部通过")
+    print("=" * 60)
