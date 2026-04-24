@@ -1,0 +1,247 @@
+# face_detection.py
+# face_detection.py
+import cv2
+import numpy as np
+import os
+import sys
+import argparse
+import logging
+from typing import Tuple, Optional
+
+# =============================
+# 1. 配置与日志设置
+# =============================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("face_detection.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("FaceDetectionSystem")
+
+
+# =============================
+# 2. 摄像头检测与初始化模块（优化版）
+# =============================
+def find_usb_camera_index() -> Optional[int]:
+    """自动检测外接USB摄像头索引（智能识别）"""
+    logger.info("🔍 正在检测外接摄像头...")
+
+    # 尝试常见索引（0-5）并记录分辨率
+    camera_candidates = []
+
+    for idx in range(6):  # 通常外接摄像头在0-5索引
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            # 获取分辨率
+            width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            cap.release()
+
+            # 外接摄像头通常分辨率>640x480
+            if width > 640 or height > 480:
+                camera_candidates.append((idx, width, height))
+                logger.debug(f"摄像头索引 {idx} 可用: {width}x{height}")
+
+    # 按分辨率排序（优先高分辨率）
+    camera_candidates.sort(key=lambda x: x[1] * x[2], reverse=True)
+
+    if not camera_candidates:
+        logger.warning("⚠️ 未检测到外接摄像头！尝试以下解决方案：")
+        logger.warning("1. 确保摄像头已连接并通电")
+        logger.warning("2. 检查摄像头是否被其他程序占用")
+        logger.warning("3. 尝试重新插拔摄像头")
+        return None
+
+    # 选择最高分辨率的摄像头
+    camera_index, width, height = camera_candidates[0]
+    logger.info(f"✅ 检测到外接摄像头: 索引 {camera_index} (分辨率 {width}x{height})")
+    return camera_index
+
+
+def initialize_camera(camera_index: int) -> Optional[cv2.VideoCapture]:
+    """初始化摄像头（智能分辨率设置）"""
+    cap = cv2.VideoCapture(camera_index)
+
+    if not cap.isOpened():
+        logger.error(f"❌ 无法打开摄像头索引 {camera_index}")
+        return None
+
+    # 智能分辨率设置（根据摄像头能力）
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+    # 验证实际分辨率
+    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+
+    # 如果设置失败，尝试1280x720
+    if width < 1280 or height < 720:
+        logger.warning(f"⚠️ 高分辨率设置失败，尝试1280x720")
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+
+    logger.info(f"✅ 摄像头初始化成功: {width}x{height} @ 30fps")
+    return cap
+
+
+# =============================
+# 3. 人脸检测模块
+# =============================
+def load_haar_cascade() -> cv2.CascadeClassifier:
+    """加载预训练Haar级联人脸分类器（专业级）"""
+    haarcascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+
+    if not os.path.exists(haarcascade_path):
+        logger.error(f"❌ Haar级联文件缺失: {haarcascade_path}")
+        logger.error("请确保安装了OpenCV的haarcascades数据包")
+        logger.error("解决方案: `pip install opencv-contrib-python`")
+        sys.exit(1)
+
+    face_cascade = cv2.CascadeClassifier(haarcascade_path)
+    if face_cascade.empty():
+        logger.error("❌ Haar级联分类器加载失败")
+        sys.exit(1)
+
+    logger.info("✅ Haar级联人脸分类器加载成功")
+    return face_cascade
+
+
+def detect_faces(
+        frame: np.ndarray,
+        face_cascade: cv2.CascadeClassifier
+) -> Tuple[np.ndarray, int]:
+    """在图像帧中检测人脸（专业级实现）"""
+    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # 专业级人脸检测参数
+    faces = face_cascade.detectMultiScale(
+        gray_frame,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(30, 30),
+        flags=cv2.CASCADE_SCALE_IMAGE
+    )
+
+    # 绘制人脸方框
+    for (x, y, w, h) in faces:
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    return frame, len(faces)
+
+
+# =============================
+# 4. 主程序模块（优化接入流程）
+# =============================
+def main():
+    """主程序入口点（优化外接摄像头接入）"""
+    logger.info("🌟 人脸检测系统启动（专业级外接摄像头支持）")
+
+    # =============================
+    # 1. 解析命令行参数（支持外接摄像头索引指定）
+    # =============================
+    parser = argparse.ArgumentParser(description='人脸检测系统')
+    parser.add_argument(
+        '--camera-index',
+        type=int,
+        default=-1,
+        help='摄像头索引（-1=自动检测，0-5=指定索引）'
+    )
+    args = parser.parse_args()
+
+    # =============================
+    # 2. 摄像头接入逻辑（优化版）
+    # =============================
+    camera_index = None
+
+    # 优先使用命令行指定的索引
+    if args.camera_index != -1:
+        logger.info(f"🔧 使用命令行指定的摄像头索引: {args.camera_index}")
+        camera_index = args.camera_index
+    else:
+        # 自动检测外接摄像头
+        camera_index = find_usb_camera_index()
+
+    # 如果自动检测失败且未指定索引
+    if camera_index is None:
+        # 提示用户手动输入
+        try:
+            camera_index = int(input("\n❌ 未检测到外接摄像头，请输入摄像头索引（0-5）: "))
+            if camera_index < 0 or camera_index > 5:
+                raise ValueError
+        except (ValueError, EOFError):
+            logger.error("❌ 无效的摄像头索引，程序退出")
+            sys.exit(1)
+
+    # 初始化摄像头
+    cap = initialize_camera(camera_index)
+    if cap is None:
+        logger.critical("❌ 摄像头初始化失败，程序退出")
+        sys.exit(1)
+
+    # =============================
+    # 3. 人脸检测初始化
+    # =============================
+    face_cascade = load_haar_cascade()
+
+    # =============================
+    # 4. 主循环（专业级实时性能）
+    # =============================
+    logger.info("✅ 人脸检测系统已启动，按 'q' 退出")
+    frame_count = 0
+    start_time = cv2.getTickCount()
+
+    while True:
+        # 读取帧
+        ret, frame = cap.read()
+        if not ret:
+            logger.warning("⚠️ 摄像头帧读取失败，跳过当前帧")
+            continue
+
+        # 人脸检测
+        processed_frame, num_faces = detect_faces(frame, face_cascade)
+
+        # 显示信息
+        cv2.putText(processed_frame,
+                    f"人脸: {num_faces}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2)
+
+        cv2.putText(processed_frame,
+                    f"帧率: {1000.0 / (cv2.getTickCount() - start_time):.1f} fps",
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 0),
+                    1)
+
+        # 显示结果
+        cv2.imshow("人脸检测系统", processed_frame)
+
+        # 检查退出键
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+        # 更新帧率计数
+        frame_count += 1
+        start_time = cv2.getTickCount()
+
+    # 清理资源
+    cap.release()
+    cv2.destroyAllWindows()
+    logger.info("✅ 人脸检测系统已安全退出")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.critical(f"❌ 系统发生严重错误: {str(e)}", exc_info=True)
+        sys.exit(1)
