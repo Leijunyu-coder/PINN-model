@@ -1,0 +1,420 @@
+"""
+批量推理脚本 - 光斑畸变识别
+读取 labels_file 文件夹中的光斑图像，调用 PINN 模型进行畸变识别
+输出可视化结果和 JSON 报告
+"""
+
+# !/usr/bin/env python3
+"""
+批量推理脚本 - 光斑畸变识别
+读取 labels_file 文件夹中的光斑图像，调用 PINN 模型进行畸变识别
+输出可视化结果和 JSON 报告
+"""
+
+import os
+import json
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Tuple, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import numpy as np
+
+# 使用非交互式后端
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# 配置
+LABELS_FILE_DIR = Path("labels_file")
+OUTPUT_DIR = Path("runs")
+MODEL_PATH = OUTPUT_DIR / "best_pinn_distortion.pt"
+BATCH_SIZE = 4
+IMAGE_SIZE = 256
+NUM_CLASSES = 8
+
+# 畸变类型标签
+DISTORTION_TYPES = [
+    "无畸变",
+    "桶形畸变",
+    "枕形畸变",
+    "波浪畸变",
+    "切向畸变",
+    "径向畸变",
+    "复合畸变",
+    "其他畸变"
+]
+
+
+class PhysicsInformedNN(nn.Module):
+    """物理信息神经网络 - 光学畸变识别（与训练时一致的架构）"""
+
+    def __init__(self, num_classes: int = NUM_CLASSES):
+        super().__init__()
+
+        # 特征提取器（CNN）- 与训练时完全一致
+        self.features = nn.Sequential(
+            # 输入：1x256x256
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # 32x128x128
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # 64x64x64
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # 128x32x32
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),  # 256x16x16
+
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((4, 4)),  # 512x4x4
+        )
+
+        # 物理约束层（模拟波前传播）
+        self.physics_layer = nn.Sequential(
+            nn.Linear(512 * 4 * 4, 1024),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+        )
+
+        # 分类头
+        self.classifier = nn.Linear(512, num_classes)
+
+        # 回归头（强度预测）
+        self.regressor = nn.Linear(512, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 特征提取
+        features = self.features(x)
+        features = features.view(features.size(0), -1)
+
+        # 物理约束
+        physics = self.physics_layer(features)
+
+        # 分类和回归
+        class_output = self.classifier(physics)
+        strength_output = torch.sigmoid(self.regressor(physics))
+
+        return class_output, strength_output.squeeze()
+
+
+def load_pinn_model(weight_path: str, device: torch.device) -> PhysicsInformedNN:
+    """加载 PINN 模型及权重"""
+    model = PhysicsInformedNN(num_classes=NUM_CLASSES)
+
+    weight_file = Path(weight_path)
+    if weight_file.exists():
+        checkpoint = torch.load(weight_file, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print(f"✓ 模型已加载：{weight_path}")
+
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"  总参数量：{total_params:,}")
+    else:
+        print(f"⚠ 警告：模型文件不存在：{weight_path}")
+
+    model = model.to(device)
+    model.eval()
+
+    return model
+
+
+def get_distortion_type(class_idx: int) -> str:
+    """根据类别索引获取畸变类型名称"""
+    if 0 <= class_idx < len(DISTORTION_TYPES):
+        return DISTORTION_TYPES[class_idx]
+    return "未知畸变"
+
+
+# 配置
+LABELS_FILE_DIR = Path("labels_file")
+OUTPUT_DIR = Path("runs")
+MODEL_PATH = OUTPUT_DIR / "best_pinn_distortion.pt"
+BATCH_SIZE = 4
+
+
+class InferenceDataset(Dataset):
+    """推理数据集 - 从 labels_file 文件夹读取光斑图像"""
+
+    def __init__(
+            self,
+            images_dir: Path,
+            transform: transforms.Compose
+    ):
+        self.images_dir = images_dir
+        self.transform = transform
+        self.image_files: List[Path] = []
+
+        # 扫描文件夹中的所有图像文件
+        valid_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif'}
+        if images_dir.exists():
+            for file_path in sorted(images_dir.iterdir()):
+                if file_path.suffix.lower() in valid_extensions:
+                    self.image_files.append(file_path)
+
+        print(f"📁 发现 {len(self.image_files)} 张光斑图像")
+
+    def __len__(self) -> int:
+        return len(self.image_files)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str, str]:
+        img_path = self.image_files[idx]
+        image = Image.open(img_path).convert("L")  # 转为灰度图
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, img_path.name, str(img_path)
+
+
+class BatchInferencer:
+    """批量推理器"""
+
+    def __init__(self, model: PhysicsInformedNN, device: torch.device):
+        self.model = model.to(device)
+        self.device = device
+        self.model.eval()
+
+    def predict_batch(self, data_loader: DataLoader) -> List[Dict]:
+        """批量预测"""
+        results = []
+
+        with torch.no_grad():
+            for images, filenames, paths in data_loader:
+                images = images.to(self.device)
+
+                # 模型推理（返回 2 个值：分类和强度）
+                cls_output, strength_output = self.model(images)
+
+                # 获取预测结果
+                predicted_classes = cls_output.argmax(dim=1).cpu().numpy()
+                strengths = strength_output.cpu().numpy()
+                confidences = F.softmax(cls_output, dim=1).max(dim=1).values.cpu().numpy()
+
+                for i in range(len(filenames)):
+                    results.append({
+                        "filename": filenames[i],
+                        "file_path": str(paths[i]),
+                        "distortion_type": get_distortion_type(predicted_classes[i]),
+                        "distortion_class": int(predicted_classes[i]),
+                        "strength": float(strengths[i]),
+                        "confidence": float(confidences[i]),
+                        "timestamp": datetime.now().isoformat()
+                    })
+
+        return results
+
+
+def visualize_results(
+        results: List[Dict],
+        images_dir: Path,
+        output_path: Path,
+        max_images: int = 12
+):
+    """可视化推理结果
+
+    Args:
+        results: 推理结果列表
+        images_dir: 图像目录
+        output_path: 输出路径
+        max_images: 最多显示的图像数量
+    """
+    n_images = min(len(results), max_images)
+
+    if n_images == 0:
+        print("⚠ 没有图像可可视化")
+        return
+
+    # 计算布局：每行显示 4 张图片
+    n_cols = 4
+    n_rows = (n_images + n_cols - 1) // n_cols
+
+    fig = plt.figure(figsize=(16, 4 * n_rows))
+
+    for idx, result in enumerate(results[:n_images]):
+        ax = plt.subplot(n_rows, n_cols, idx + 1)
+
+        img_path = Path(result["file_path"])
+        if img_path.exists():
+            image = Image.open(img_path).convert("L")
+            ax.imshow(image, cmap='gray')
+
+        # 标题：文件名 + 畸变类型 + 强度 + 置信度
+        title = (
+            f"{result['filename']}\n"
+            f"{result['distortion_type']}\n"
+            f"强度：{result['strength']:.3f}\n"
+            f"置信度：{result['confidence']:.3f}"
+        )
+        ax.set_title(title, fontsize=9, pad=5)
+        ax.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    print(f"✓ 可视化结果已保存：{output_path}")
+
+
+def save_results_json(results: List[Dict], output_path: Path):
+    """保存结果为 JSON 文件"""
+    # 添加元数据
+    output_data = {
+        "metadata": {
+            "timestamp": datetime.now().isoformat(),
+            "total_images": len(results),
+            "model_path": str(MODEL_PATH),
+            "source_directory": str(LABELS_FILE_DIR)
+        },
+        "results": results
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, indent=2, ensure_ascii=False)
+
+    print(f"✓ JSON 结果已保存：{output_path}")
+
+
+def print_summary(results: List[Dict]):
+    """打印结果摘要"""
+    print("\n" + "=" * 70)
+    print("📊 PINN 光斑畸变识别结果摘要")
+    print("=" * 70)
+    print(f"{'文件名':<20} {'畸变类型':<15} {'强度':<10} {'置信度':<10}")
+    print("-" * 70)
+
+    for result in results:
+        print(
+            f"{result['filename']:<20} "
+            f"{result['distortion_type']:<15} "
+            f"{result['strength']:<10.4f} "
+            f"{result['confidence']:<10.4f}"
+        )
+
+    # 统计畸变类型
+    distortion_counts = {}
+    for result in results:
+        dtype = result["distortion_type"]
+        distortion_counts[dtype] = distortion_counts.get(dtype, 0) + 1
+
+    print("\n📈 畸变类型统计:")
+    for dtype, count in sorted(distortion_counts.items(), key=lambda x: -x[1]):
+        percentage = count / len(results) * 100
+        print(f"  {dtype}: {count} 张 ({percentage:.1f}%)")
+
+    print("\n" + "=" * 70)
+    print(f"✅ 共识别 {len(results)} 张光斑图像")
+    print("=" * 70)
+
+
+def batch_inference(
+        images_dir: Path = LABELS_FILE_DIR,
+        model_path: Path = MODEL_PATH,
+        output_dir: Path = OUTPUT_DIR
+):
+    """执行批量推理
+
+    Args:
+        images_dir: 图像目录
+        model_path: 模型权重路径
+        output_dir: 输出目录
+    """
+    print("\n" + "=" * 70)
+    print("🚀 PINN 光斑畸变批量识别系统")
+    print("=" * 70)
+
+    # 检查输入目录
+    if not images_dir.exists():
+        print(f"❌ 错误：图像目录不存在：{images_dir}")
+        print(f"请将待识别的光斑图像放入 '{images_dir}' 文件夹中")
+        return None
+
+    # 创建设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"💻 运行设备：{device}")
+
+    # 加载模型
+    print("\n📦 加载模型...")
+    model = load_pinn_model(str(model_path), device)
+
+    # 数据预处理
+    transform = transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5]),
+    ])
+
+    # 创建数据集
+    print("\n📂 加载光斑图像...")
+    dataset = InferenceDataset(images_dir, transform)
+
+    if len(dataset) == 0:
+        print(f"❌ 错误：在 '{images_dir}' 中未找到任何图像文件")
+        print(f"支持的格式：.png, .jpg, .jpeg, .bmp, .tiff, .tif")
+        return None
+
+    data_loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0  # Windows 兼容性
+    )
+
+    # 创建推理器
+    inferencer = BatchInferencer(model, device)
+
+    # 执行批量推理
+    print("\n🔍 开始识别...")
+    results = inferencer.predict_batch(data_loader)
+
+    # 创建输出目录
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 保存 JSON 结果
+    results_json_path = output_dir / "recognition_results.json"
+    save_results_json(results, results_json_path)
+
+    # 可视化结果
+    vis_path = output_dir / "batch_infer_vis.png"
+    visualize_results(results, images_dir, vis_path)
+
+    # 打印摘要
+    print_summary(results)
+
+    return results
+
+
+def main():
+    """主函数"""
+    results = batch_inference()
+
+    if results:
+        print("\n✨ 批量识别完成！")
+        print(f"📄 详细结果：{OUTPUT_DIR}/recognition_results01.json")
+        print(f"🖼️  可视化图：{OUTPUT_DIR}/batch_infer_vis.png01")
+    else:
+        print("\n❌ 识别失败，请检查输入文件和模型")
+
+
+if __name__ == "__main__":
+    main()
