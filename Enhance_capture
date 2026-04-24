@@ -1,0 +1,372 @@
+"""
+光斑图像采集与增强工具
+功能：USB 摄像头实时采集 + 轻度降噪 + 超分辨率放大 (2×)
+依赖：opencv-python, basicsr (CPU 版)
+用法：python capture_enhance.py
+"""
+
+import cv2
+import numpy as np
+import os
+import sys
+from datetime import datetime
+
+# 尝试导入 basicsr 用于超分辨率
+try:
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from realesrgan import RealESRGANer
+
+    REALESRGAN_AVAILABLE = True
+except ImportError:
+    REALESRGAN_AVAILABLE = False
+    print("⚠️  未检测到 RealESRGAN，将使用双三次插值进行放大")
+    print("   安装命令：pip install realesrgan basicsr")
+
+
+def denoise_image(image, strength=5):
+    """
+    轻度降噪 - 使用快速 NLMeans 算法
+
+    Args:
+        image: 输入图像 (BGR)
+        strength: 降噪强度 (3-10)，值越大降噪越强但细节损失越多
+
+    Returns:
+        降噪后的图像
+    """
+    # 对于光斑图像，使用适度的降噪强度
+    # h: 决定滤波器强度的参数，较高的 h 更好地去除噪声，但也更好地去除图像细节
+    # hForColorComponents: 与 h 相同，但仅适用于彩色分量
+    dst = cv2.fastNlMeansDenoisingColored(image, None, strength, strength, 7, 21)
+    return dst
+
+
+def enhance_resolution_simple(image, scale=2):
+    """
+    使用双三次插值进行简单的超分辨率放大
+
+    Args:
+        image: 输入图像
+        scale: 放大倍数
+
+    Returns:
+        放大后的图像
+    """
+    height, width = image.shape[:2]
+    new_width = width * scale
+    new_height = height * scale
+
+    # 双三次插值提供更好的质量
+    enhanced = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+
+    # 可选：轻微的锐化以增强边缘
+    kernel = np.array([[-1, -1, -1],
+                       [-1, 9, -1],
+                       [-1, -1, -1]])
+    enhanced = cv2.filter2D(enhanced, -1, kernel)
+
+    return enhanced
+
+
+def enhance_resolution_ai(image, scale=2, model_path=None):
+    """
+    使用 RealESRGAN 进行 AI 超分辨率放大
+
+    Args:
+        image: 输入图像
+        scale: 放大倍数
+        model_path: 模型路径，None 则使用默认模型
+
+    Returns:
+        放大后的图像
+    """
+    if not REALESRGAN_AVAILABLE:
+        return enhance_resolution_simple(image, scale)
+
+    try:
+        # 初始化 RealESRGAN 模型
+        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64,
+                        num_block=23, num_grow_ch=32, scale=scale)
+
+        upsampler = RealESRGANer(
+            scale=scale,
+            model_path=model_path or 'realesrgan-x2.pth',
+            model=model,
+            tile=0,  # 0 为不使用分块处理
+            tile_pad=10,
+            pre_pad=0,
+            half=False  # CPU 环境不使用半精度
+        )
+
+        # 执行超分辨率
+        enhanced, _ = upsampler.enhance(image, outscale=scale)
+        return enhanced
+
+    except Exception as e:
+        print(f"⚠️  AI 超分失败：{e}，回退到双三次插值")
+        return enhance_resolution_simple(image, scale)
+
+
+def auto_detect_camera(preferred_index=1):
+    """
+    自动检测可用的摄像头
+
+    Args:
+        preferred_index: 优先使用的摄像头索引，默认为 1（外接摄像头）
+
+    Returns:
+        摄像头索引，未找到返回 -1
+    """
+    print(f"🔍 正在检测摄像头...（优先索引 {preferred_index}）")
+
+    # 优先尝试用户指定的索引
+    cap = cv2.VideoCapture(preferred_index)
+    if cap.isOpened():
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            cap.release()
+            print(f"✓ 找到摄像头：索引 {preferred_index}")
+            return preferred_index
+        cap.release()
+
+    # 如果优先索引不可用，尝试其他索引
+    for index in range(5):
+        if index == preferred_index:
+            continue
+        cap = cv2.VideoCapture(index)
+        if cap.isOpened():
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                cap.release()
+                print(f"✓ 找到备用摄像头：索引 {index}")
+                return index
+            cap.release()
+
+    print("❌ 未找到可用的摄像头")
+    return -1
+
+
+def capture_and_enhance(output_dir='captured_images',
+                        num_images=10,
+                        denoise_strength=5,
+                        upscale_scale=2,
+                        use_ai_superres=False):
+    """
+    主函数：采集图像并增强
+
+    Args:
+        output_dir: 输出目录
+        num_images: 采集图片数量
+        denoise_strength: 降噪强度 (3-10)
+        upscale_scale: 放大倍数
+        use_ai_superres: 是否使用 AI 超分（需要安装 realesrgan）
+    """
+
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'original'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'enhanced'), exist_ok=True)
+
+    # 检测摄像头（优先使用索引 1，即外接摄像头）
+    camera_index = auto_detect_camera(preferred_index=1)
+    if camera_index == -1:
+        print("\n提示：可以按 'q' 键退出，按 's' 键手动拍照")
+        camera_index = 1  # 默认尝试外接摄像头索引 1
+
+    # 打开摄像头
+    cap = cv2.VideoCapture(camera_index)
+
+    if not cap.isOpened():
+        print(f"❌ 无法打开摄像头 {camera_index}")
+        sys.exit(1)
+
+    # 设置摄像头参数
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
+    print(f"\n📷 摄像头已启动 (索引：{camera_index})")
+    print("=" * 60)
+    print("操作说明:")
+    print("  [S] 拍摄单张照片并增强")
+    print("  [A] 连续拍摄 {num_images} 张并增强")
+    print("  [Q] 退出程序")
+    print("=" * 60)
+
+    captured_count = 0
+    auto_capture_mode = False
+
+    while True:
+        ret, frame = cap.read()
+
+        if not ret or frame is None:
+            print("⚠️  读取帧失败")
+            continue
+
+        # 显示预览（缩小显示以提高性能）
+        display_frame = cv2.resize(frame, (640, 360))
+
+        # 添加操作提示
+        cv2.putText(display_frame, "Press S: Capture | A: Auto | Q: Quit",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(display_frame, f"Captured: {captured_count}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        cv2.imshow('Camera Preview - Press S/A/Q', display_frame)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        # 自动连拍模式
+        if auto_capture_mode and captured_count < num_images:
+            key = ord('s')
+
+        if key == ord('s') or key == ord('S'):
+            # 拍摄照片
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+
+            # 保存原始图像
+            original_path = os.path.join(output_dir, 'original', f'img_{timestamp}.png')
+            cv2.imwrite(original_path, frame)
+
+            print(f"\n📸 已拍摄原始图像：{original_path}")
+
+            # 图像增强流程
+            print("  → 正在降噪...")
+            denoised = denoise_image(frame, strength=denoise_strength)
+
+            print(f"  → 正在超分辨率放大 ({upscale_scale}×)...")
+            if use_ai_superres and REALESRGAN_AVAILABLE:
+                enhanced = enhance_resolution_ai(denoised, scale=upscale_scale)
+            else:
+                enhanced = enhance_resolution_simple(denoised, scale=upscale_scale)
+
+            # 保存增强后的图像
+            enhanced_path = os.path.join(output_dir, 'enhanced', f'img_{timestamp}_enhanced.png')
+            cv2.imwrite(enhanced_path, enhanced)
+
+            print(f"  ✓ 已保存增强图像：{enhanced_path}")
+            print(f"    原始尺寸：{frame.shape[1]}x{frame.shape[0]}")
+            print(f"    增强尺寸：{enhanced.shape[1]}x{enhanced.shape[0]}")
+
+            captured_count += 1
+
+            # 显示增强效果对比
+            enhanced_preview = cv2.resize(enhanced, (640, 360))
+            cv2.imshow('Enhanced Result', enhanced_preview)
+
+            # 如果是自动模式，检查是否完成
+            if auto_capture_mode and captured_count >= num_images:
+                auto_capture_mode = False
+                print(f"\n✓ 完成 {num_images} 张照片的采集与增强")
+
+        elif key == ord('a') or key == ord('A'):
+            print(f"\n🔄 开始自动连拍 {num_images} 张...")
+            auto_capture_mode = True
+            captured_count = 0
+
+        elif key == ord('q') or key == ord('Q'):
+            break
+
+    # 清理资源
+    cap.release()
+    cv2.destroyAllWindows()
+
+    print(f"\n📊 总结:")
+    print(f"  总拍摄数量：{captured_count}")
+    print(f"  输出目录：{os.path.abspath(output_dir)}")
+    print(f"  降噪强度：{denoise_strength}")
+    print(f"  放大倍数：{upscale_scale}×")
+
+    return captured_count
+
+
+def batch_process_existing_images(input_dir, output_dir='enhanced_output',
+                                  denoise_strength=5, upscale_scale=2):
+    """
+    批量处理已有图像
+
+    Args:
+        input_dir: 输入图像目录
+        output_dir: 输出目录
+        denoise_strength: 降噪强度
+        upscale_scale: 放大倍数
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 支持的图像格式
+    extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
+
+    image_files = []
+    for f in os.listdir(input_dir):
+        if any(f.lower().endswith(ext) for ext in extensions):
+            image_files.append(f)
+
+    if not image_files:
+        print(f"❌ 在 {input_dir} 中未找到图像文件")
+        return 0
+
+    print(f"📁 找到 {len(image_files)} 张图像，开始批量处理...")
+
+    for i, filename in enumerate(image_files, 1):
+        input_path = os.path.join(input_dir, filename)
+        output_path = os.path.join(output_dir, f'enhanced_{filename}')
+
+        print(f"[{i}/{len(image_files)}] 处理：{filename}")
+
+        # 读取图像
+        image = cv2.imread(input_path)
+        if image is None:
+            print(f"  ⚠️  无法读取图像，跳过")
+            continue
+
+        # 降噪
+        denoised = denoise_image(image, strength=denoise_strength)
+
+        # 超分辨率
+        enhanced = enhance_resolution_simple(denoised, scale=upscale_scale)
+
+        # 保存
+        cv2.imwrite(output_path, enhanced)
+        print(f"  ✓ 完成：{output_path}")
+
+    print(f"\n✓ 批量处理完成，输出目录：{os.path.abspath(output_dir)}")
+    return len(image_files)
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='光斑图像采集与增强工具')
+    parser.add_argument('--mode', type=str, default='capture',
+                        choices=['capture', 'batch'],
+                        help='模式：capture(实时采集) 或 batch(批量处理已有图像)')
+    parser.add_argument('--input_dir', type=str, default='dataset/images',
+                        help='批量处理时的输入目录')
+    parser.add_argument('--output_dir', type=str, default='captured_images',
+                        help='输出目录')
+    parser.add_argument('--num_images', type=int, default=10,
+                        help='采集图片数量')
+    parser.add_argument('--denoise_strength', type=int, default=5,
+                        help='降噪强度 (3-10)，值越大降噪越强')
+    parser.add_argument('--upscale_scale', type=int, default=2,
+                        help='放大倍数 (2 或 4)')
+    parser.add_argument('--use_ai', action='store_true',
+                        help='使用 AI 超分 (需安装 realesrgan)')
+
+    args = parser.parse_args()
+
+    if args.mode == 'capture':
+        capture_and_enhance(
+            output_dir=args.output_dir,
+            num_images=args.num_images,
+            denoise_strength=args.denoise_strength,
+            upscale_scale=args.upscale_scale,
+            use_ai_superres=args.use_ai
+        )
+    else:
+        batch_process_existing_images(
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+            denoise_strength=args.denoise_strength,
+            upscale_scale=args.upscale_scale
+        )
